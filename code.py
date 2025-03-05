@@ -13,7 +13,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 # Load the dataset
 file_path = "./Threauptic Solution.csv"
 df = pd.read_csv(file_path)
-
+# still code is there
 # Selecting relevant columns
 texts = df['Symptoms'].tolist()
 labels = df['Diagnosis / Condition'].tolist()
