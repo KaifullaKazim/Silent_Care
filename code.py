@@ -1,175 +1,105 @@
 import pandas as pd
-import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from transformers import RobertaTokenizer, RobertaModel
-from transformers import get_scheduler
-from torch.optim import AdamW
-from torch.nn import functional as F
-from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.feature_extraction.text import TfidfVectorizer
-
-# Load the dataset
-file_path = "./Threauptic Solution.csv"
-df = pd.read_csv(file_path)
-# still code is there
-# Selecting relevant columns
-texts = df['Symptoms'].tolist()
-labels = df['Diagnosis / Condition'].tolist()
-
-# Converting labels to numerical values
-label_to_id = {label: idx for idx, label in enumerate(set(labels))}
-id_to_label = {idx: label for label, idx in label_to_id.items()}
-n_classes = len(label_to_id)
-
-labels = [label_to_id[label] for label in labels if label in label_to_id]
-print("Unique training labels:", set(labels))
-print("Expected label range: 0 to", len(label_to_id) - 1)
-assert all(0 <= label < len(label_to_id) for label in labels), "Found an invalid label!"
-print("Unique labels in training data:", set(labels))
-print("Expected label range: 0 to", len(label_to_id) - 1)
-
-# Initialize tokenizer
-tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
-
-# Apply TF-IDF to convert text into numerical form
-vectorizer = TfidfVectorizer(max_features=5000)
-X_tfidf = vectorizer.fit_transform(texts)
-
-# Apply SMOTE for class balancing
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, classification_report
 from imblearn.over_sampling import SMOTE
-ros = SMOTE(random_state=42, k_neighbors=5)
-train_texts, val_texts, train_labels, val_labels = train_test_split(texts, labels, test_size=0.2, stratify=labels, random_state=42)
-X_resampled, labels_resampled = ros.fit_resample(X_tfidf, labels)
-train_texts = vectorizer.inverse_transform(X_resampled)
-train_texts = [' '.join(words) for words in train_texts]  # Properly convert back to text
-train_labels = labels_resampled
+import xgboost as xgb
+from sentence_transformers import SentenceTransformer
+from scipy.sparse import hstack
 
-# Splitting data
-from sklearn.model_selection import train_test_split
-train_texts, val_texts, train_labels, val_labels = train_test_split(train_texts, train_labels, test_size=0.2, random_state=42)
+# Load preprocessed dataset
+df = pd.read_excel("D:\Downloads\Silent_Care\processed_therapeutic_solution.xlsx")
 
-# Custom Dataset class
-class EmotionDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length=64):
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+# Encode categorical variables
+label_encoders = {}
+categorical_cols = ['gender', 'previous_diagnosis', 'therapy_history', 'medication', 'diagnosis_condition']
 
-    def __len__(self):
-        return len(self.texts)
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        label = self.labels[idx]
-        encoding = self.tokenizer(text, return_tensors='pt', max_length=self.max_length, padding='max_length', truncation=True)
-        return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'label': torch.tensor(label, dtype=torch.long)
-        }
+for col in categorical_cols:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col])
+    label_encoders[col] = le  # Save the encoders for future use
 
-# Creating datasets
-dataset_train = EmotionDataset(train_texts, train_labels, tokenizer)
-dataset_val = EmotionDataset(val_texts, val_labels, tokenizer)
+# Encode target variable (suggested_therapy)
+le_therapy = LabelEncoder()
+df['suggested_therapy'] = le_therapy.fit_transform(df['suggested_therapy'])
 
-# DataLoaders
-train_dataloader = DataLoader(dataset_train, batch_size=16, shuffle=True)
-val_dataloader = DataLoader(dataset_val, batch_size=16)
+# Use a faster BERT model for embeddings
+bert_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+symptom_embeddings = np.array(bert_model.encode(df['symptoms'].tolist(), batch_size=32, show_progress_bar=True))
 
-# Define DistilBERT Classifier Model
-class RobertaClassifier(nn.Module):
-    def __init__(self, num_classes):
-        super(RobertaClassifier, self).__init__()
-        self.bert = RobertaModel.from_pretrained('roberta-base')
-        for param in self.bert.parameters():
-            param.requires_grad = False  # Freeze BERT layers
-        for param in self.bert.encoder.layer[-4:].parameters():
-            param.requires_grad = True  # Unfreeze last 2 layers
-        self.dropout = nn.Dropout(0.1)
-        self.fc = nn.Linear(self.bert.config.hidden_size, num_classes)
-        self.dropout = nn.Dropout(0.1)
-        self.dropout = nn.Dropout(0.1)
-        self.num_labels = num_classes
-    def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        x = outputs.last_hidden_state[:, 0, :]  # Use [CLS] token representation
-        x = outputs.last_hidden_state[:, 0, :]  # Use [CLS] token representation
-        x = outputs.last_hidden_state[:, 0, :]  # Use [CLS] token representation
-        x = self.dropout(outputs.last_hidden_state[:, 0, :])
-        logits = self.fc(x)
-        return logits
+# Define features (X) and target (y)
+numeric_features = df[['age', 'gender', 'duration_(weeks)', 'previous_diagnosis', 'therapy_history',
+                        'medication', 'diagnosis_condition', 'mood', 'stress_level', 'urgency_level']]
+X = np.hstack([symptom_embeddings, numeric_features])  # Combine BERT embeddings and numerical features
+y = df['suggested_therapy']
 
-# Define Focal Loss with Class Weights
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.gamma = gamma
-        self.reduction = reduction
-        self.alpha = alpha if alpha is not None else torch.ones(n_classes)
+# Handle class imbalance using SMOTE for multi-class classification
+unique_classes, class_counts = np.unique(y, return_counts=True)
+sampling_strategy = {class_label: int(count * 1.2) for class_label, count in zip(unique_classes, class_counts)}
+smote = SMOTE(random_state=42, sampling_strategy=sampling_strategy)
+X_resampled, y_resampled = smote.fit_resample(X, y)
 
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha.to(inputs.device))
-        pt = torch.exp(-ce_loss)
-        focal_loss = (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean() if self.reduction == 'mean' else focal_loss.sum()
+# Split data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X_resampled, y_resampled, test_size=0.2, random_state=42)
 
-# Training function
-def train(model, data_loader, optimizer, scheduler, device, loss_fn):
-    model.train()
-    total_loss = 0
-    for batch in data_loader:
-        optimizer.zero_grad()
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['label'].to(device, dtype=torch.long)
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        loss = loss_fn(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        total_loss += loss.item()
-    return total_loss / len(data_loader)
+# Hyperparameter tuning with a reduced GridSearchCV search space
+param_grid = {
+    'max_depth': [6],
+    'learning_rate': [0.1],
+    'n_estimators': [200],
+    'subsample': [0.8],
+    'colsample_bytree': [0.8]
+}
 
-# Evaluation function
-def evaluate(model, data_loader, device):
-    model.eval()
-    predictions = []
-    actual_labels = []
-    with torch.no_grad():
-        for batch in data_loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['label'].to(device, dtype=torch.long).view(-1)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            _, preds = torch.max(outputs, dim=1)
-            predictions.extend(preds.cpu().tolist())
-            actual_labels.extend(labels.cpu().tolist())
-    from sklearn.metrics import accuracy_score, classification_report
-    return accuracy_score(actual_labels, predictions), classification_report(actual_labels, predictions, target_names=list(label_to_id.keys()))
+xgb_model = xgb.XGBClassifier(objective='multi:softmax', num_class=len(le_therapy.classes_),
+                              random_state=42, tree_method='hist', device='cuda')  # Fix GPU compatibility
 
-# Training setup
-import os
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = RobertaClassifier(n_classes).to(device)
-optimizer = AdamW(model.parameters(), lr=5e-6)
-total_steps = len(train_dataloader) * 10  # 10 epochs
-scheduler = get_scheduler("cosine", optimizer=optimizer, num_warmup_steps=0, num_training_steps=total_steps)
-class_weights = torch.tensor([1.0, 2.0, 2.5, 1.5, 3.0]).to(device)  # Adjust weights based on class distribution
-loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, cv=2, n_jobs=-1, verbose=2)  # Reduce folds to speed up
 
-# Training loop
-for epoch in range(10):
-    print(f"Epoch {epoch + 1}/10")
-    train_loss = train(model, train_dataloader, optimizer, scheduler, device, loss_fn)
-    accuracy, report = evaluate(model, val_dataloader, device)
-    print(f"Train Loss: {train_loss:.4f}")
-    print(f"Validation Accuracy: {accuracy:.4f}")
-    print(report)
+grid_search.fit(X_train, y_train)
 
-# Save model
-torch.save(model.state_dict(), "distilbert_emotion_classifier.pth")
+# Best model from GridSearchCV
+best_model = grid_search.best_estimator_
+
+# Predict on test set
+y_pred = best_model.predict(X_test)
+
+# Evaluate Model
+accuracy = accuracy_score(y_test, y_pred)
+print("Optimized Model Accuracy:", accuracy)
+print("Classification Report:")
+print(classification_report(y_test, y_pred))
+
+# Function to predict therapy based on user input
+def recommend_therapy(user_data):
+    user_df = pd.DataFrame([user_data])
+    for col in categorical_cols:
+        if user_df[col][0] in label_encoders[col].classes_:
+            user_df[col] = label_encoders[col].transform([user_df[col][0]])
+        else:
+            user_df[col] = -1  # Assign unseen categories to -1
+
+    symptom_vector = bert_model.encode([user_df['symptoms'][0]])
+    numeric_data = np.array(user_df[['age', 'gender', 'duration_(weeks)', 'previous_diagnosis', 'therapy_history',
+                                     'medication', 'diagnosis_condition', 'mood', 'stress_level', 'urgency_level']])
+    user_input_features = np.hstack([symptom_vector, numeric_data])
+
+    therapy_pred = best_model.predict(user_input_features.reshape(1, -1))[0]
+    return le_therapy.inverse_transform([therapy_pred])[0]
+
+# Example usage
+user_input = {'age': 30, 'gender': 'male', 'duration_(weeks)': 20, 'previous_diagnosis': 'anxiety',
+              'therapy_history': 'yes', 'medication': 'no', 'diagnosis_condition': 'stress',
+              'mood': 5, 'stress_level': 7, 'urgency_level': 2, 'symptoms': 'feeling anxious and trouble sleeping'}
+
+# Convert categorical input to match encoding
+for col in categorical_cols:
+    if user_input[col] in label_encoders[col].classes_:
+        user_input[col] = label_encoders[col].transform([user_input[col]])[0]
+    else:
+        user_input[col] = -1  # Assign unseen categories to -1
+
+# Get therapy recommendation
+recommended_therapy = recommend_therapy(user_input)
+print("Recommended Therapy:", recommended_therapy)
