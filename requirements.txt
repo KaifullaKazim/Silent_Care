@@ -1,0 +1,13 @@
+tensorflow==2.15.0
+tf-keras==2.15.0
+keras==2.15.0
+transformers==4.37.2
+sentence-transformers
+ml-dtypes
+tensorboard
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+opencv-python
